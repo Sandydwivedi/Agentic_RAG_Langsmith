@@ -5,3 +5,5 @@ data/
 __pycache__/
 *.pyc
 .streamlit/
+knowledge_base
+permanent_store
