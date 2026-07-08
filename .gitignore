@@ -7,3 +7,5 @@ __pycache__/
 .streamlit/
 knowledge_base
 permanent_store
+.env
+utils/.env
