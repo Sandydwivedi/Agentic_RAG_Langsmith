@@ -1,24 +1,27 @@
 """
-agent.py — v3
+agent.py — v4
 =============
-LangGraph agent — ReAct loop with all fixes applied.
+LangGraph agent — ReAct loop with all fixes applied + LangSmith feedback.
 
-v3 CHANGES (model reliability fix):
-- GROQ_MODELS updated. As of June 2026, Groq deprecated
-  llama-3.1-8b-instant and llama-3.3-70b-versatile on the free/developer
-  tier (recommended replacements: openai/gpt-oss-120b / gpt-oss-20b).
-  llama3-70b-8192 was already fully decommissioned (hard 400 error).
-  New list leads with the currently-recommended production models and
-  keeps llama-3.3-70b-versatile as a last-resort (it still often works,
-  just rate-limited under load).
-- FIXED retry bug: previously, on a 429 the code slept 5s and then moved
-  on to the NEXT model in the list anyway — the 5s wait was wasted and
-  the same (often best) model was never actually retried. Now it retries
-  the SAME model up to RETRY_LIMIT times after a 429 before giving up on it.
-- FIXED 413 (payload too large): smaller models in the fallback chain
-  have tighter context windows. `_safe_truncate()` now caps the
-  retrieved-content payload per model so a 20-chunk KB result doesn't
-  blow past a small model's limit and hard-fail.
+v4 CHANGES (this round — LangSmith feedback wiring):
+- Automatic tracing (retrieve_kb/writer/after_writer nodes, latency, tokens)
+  was ALREADY working before this — LangChain/LangGraph send that on their
+  own once LANGCHAIN_TRACING_V2=true is set in .env. That part needed no
+  code change.
+- WHAT WAS MISSING: the custom metrics this file already computes
+  (grounded, faithfulness_score, react_iterations, model_used) were only
+  ever returned as a Python dict — they stayed inside the Streamlit
+  session and never reached LangSmith. The "Feedback" tab on every trace
+  was empty because of this.
+- FIX: 3 small additions —
+    1. `from langsmith import Client, traceable` + `ls_client = Client()`
+    2. `run_agent()` wrapped with `@traceable` so we can grab its own
+       run_id (needed to know WHICH trace to attach feedback to).
+    3. `_send_langsmith_feedback()` — called at the end of writer_node,
+       pushes each metric as a separate feedback entry
+       (`ls_client.create_feedback(run_id, key=..., score=...)`).
+  Nothing else changed — same GROQ_MODELS, same retry logic, same
+  ReAct flow as v3.
 """
 
 import os
@@ -33,7 +36,17 @@ from langgraph.graph.message import add_messages
 from langchain_community.vectorstores import FAISS
 from utils.tools import get_all_tools
 
+# ── NEW: LangSmith client ─────────────────────────────────────────────────────
+# `Client()` reads LANGCHAIN_API_KEY / LANGCHAIN_ENDPOINT from your .env
+# automatically (same env vars that already make automatic tracing work).
+# `traceable` is a decorator — it marks a function as "this is one LangSmith
+# run", and lets us read back that run's own ID from inside the function.
+from langsmith import Client, traceable
+from langsmith.run_helpers import get_current_run_tree
+
 load_dotenv()
+
+ls_client = Client()
 
 # NEW: updated for June 2026 Groq deprecations. Order = preference.
 # Each entry also carries a safe context budget (approx chars of
@@ -133,6 +146,7 @@ class AgentState(TypedDict):
     all_retrieved_text: str
     chat_history: list[dict]
     eval_metrics: dict
+    run_id: Optional[str]   # NEW — so writer_node knows which LangSmith run to attach feedback to
 
 
 MAX_REACT_ITERATIONS = 3
@@ -178,6 +192,38 @@ def _build_metrics(state, grounded, iterations, response_time, model=None, answe
         "model_used": model,
         "faithfulness_score": faith,
     }
+
+
+# ── NEW: push the metrics dict above into LangSmith's Feedback tab ──────────
+def _send_langsmith_feedback(metrics: dict, run_id: Optional[str]) -> None:
+    """
+    `create_feedback(run_id, key, score)` attaches ONE score to ONE run.
+    A single call only takes one key at a time, so we call it once per
+    metric. `run_id` is what LangSmith uses to know WHICH trace (the one
+    you see in the dashboard) this feedback belongs to.
+
+    Wrapped in try/except so that if the network is down or LangSmith is
+    blocked (like your earlier "site blocked" issue), the chat still
+    works normally — feedback just silently doesn't get sent, instead of
+    crashing the whole answer.
+    """
+    if not run_id:
+        print("[langsmith] no run_id — feedback skipped (tracing may be off)")
+        return
+    try:
+        ls_client.create_feedback(run_id, key="grounded", score=1.0 if metrics.get("grounded") else 0.0)
+        ls_client.create_feedback(run_id, key="faithfulness_score", score=metrics.get("faithfulness_score", 0.0))
+        ls_client.create_feedback(run_id, key="react_iterations", score=metrics.get("react_iterations", 0))
+        ls_client.create_feedback(run_id, key="response_time_sec", score=metrics.get("response_time_sec", 0.0))
+        ls_client.create_feedback(
+            run_id, key="source_used", score=1.0, comment=str(metrics.get("source", "unknown"))
+        )
+        ls_client.create_feedback(
+            run_id, key="model_used", score=1.0, comment=str(metrics.get("model_used", "unknown"))
+        )
+        print(f"[langsmith] feedback sent for run {run_id}")
+    except Exception as e:
+        print(f"[langsmith] feedback failed (app keeps working normally): {e}")
 
 
 def _safe_truncate(text: str, max_chars: int) -> str:
@@ -383,12 +429,14 @@ def build_langgraph_agent(db: FAISS, all_chunks: list = None):
         start_time = time.time()
 
         if not tool_results:
+            metrics = _build_metrics(state, False, 0, time.time() - start_time)
+            _send_langsmith_feedback(metrics, state.get("run_id"))  # NEW
             return {
                 "messages": [AIMessage(content=FALLBACK_TEXT)],
                 "source": state.get("source", "unknown"),
                 "grounded": False,
                 "partial": False,
-                "eval_metrics": _build_metrics(state, False, 0, time.time() - start_time),
+                "eval_metrics": metrics,
             }
 
         history_text = _format_chat_history(chat_history)
@@ -396,7 +444,7 @@ def build_langgraph_agent(db: FAISS, all_chunks: list = None):
         raw_text = None
         model_used = None
 
-        # NEW: try each model with its own safe content budget — the
+        # try each model with its own safe content budget — the
         # smallest model in the chain gets a tighter truncation so it
         # doesn't 413 on a large KB dump.
         for model_cfg in GROQ_MODELS:
@@ -418,29 +466,34 @@ def build_langgraph_agent(db: FAISS, all_chunks: list = None):
                 break
 
         if raw_text is None:
+            metrics = _build_metrics(state, False, 0, time.time() - start_time)
+            _send_langsmith_feedback(metrics, state.get("run_id"))  # NEW
             return {
                 "messages": [AIMessage(content="Could not generate response. Try again.")],
                 "source": state.get("source", "unknown"),
                 "grounded": False,
                 "partial": False,
-                "eval_metrics": _build_metrics(state, False, 0, time.time() - start_time),
+                "eval_metrics": metrics,
             }
 
         clean_text, grounded, partial = _parse_tagged_response(raw_text)
         response_time = time.time() - start_time
+
+        metrics = _build_metrics(
+            state, grounded,
+            state.get("react_iterations", 0),
+            response_time, model_used,
+            answer=clean_text,
+            retrieved=tool_results,
+        )
+        _send_langsmith_feedback(metrics, state.get("run_id"))  # NEW — this is the actual fix
 
         return {
             "messages": [AIMessage(content=clean_text)],
             "source": state.get("source", "unknown") if grounded else ("web" if state.get("web_tried") else "unknown"),
             "grounded": grounded,
             "partial": partial,
-            "eval_metrics": _build_metrics(
-                state, grounded,
-                state.get("react_iterations", 0),
-                response_time, model_used,
-                answer=clean_text,
-                retrieved=tool_results,
-            ),
+            "eval_metrics": metrics,
         }
 
     # ── Routing ────────────────────────────────────────────────────────────────
@@ -491,8 +544,19 @@ def build_langgraph_agent(db: FAISS, all_chunks: list = None):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# NEW: @traceable wraps this whole function as one LangSmith run. This is
+# ALSO what lets us call get_current_run_tree() below and read that run's
+# own ID — without this decorator, get_current_run_tree() would return None.
+@traceable(name="aws_kb_agent")
 def run_agent(question: str, db: FAISS, chat_history: list[dict], all_chunks: list = None) -> dict:
     agent = build_langgraph_agent(db, all_chunks=all_chunks)
+
+    # NEW: grab this run's own ID (only works because of @traceable above)
+    # so we can tell writer_node "this is the trace to attach feedback to".
+    run_tree = get_current_run_tree()
+    run_id = str(run_tree.id) if run_tree else None
+    if not run_id:
+        print("[langsmith] no run_id — check LANGCHAIN_TRACING_V2 / LANGCHAIN_API_KEY in .env")
 
     result = agent.invoke({
         "messages": [HumanMessage(content=question)],
@@ -508,6 +572,7 @@ def run_agent(question: str, db: FAISS, chat_history: list[dict], all_chunks: li
         "react_iterations": 0,
         "chat_history": chat_history,
         "eval_metrics": {},
+        "run_id": run_id,   # NEW — passed into the graph state so writer_node can use it
     }) or {}
 
     answer = FALLBACK_TEXT
